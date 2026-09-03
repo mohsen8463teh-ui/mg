@@ -1,0 +1,1460 @@
+name: MG-Full-Pipeline
+
+on:
+  push:
+    branches: [ "**" ]
+  workflow_dispatch:
+
+jobs:
+  pipeline:
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Bootstrap project source (self-contained)
+        run: |
+          mkdir -p tests outputs
+          cat > requirements.txt <<'EOF'
+          pandas>=2.0
+          numpy>=1.24
+          requests>=2.31
+          EOF
+          cat > config.py <<'EOF'
+          """MG Project - global configuration. Baseline logic: MG-RULEBOOK v1.0-BASELINE.
+          v1.0.1-IMPL: DATA_START moved to 2018-01-01 as burn-in year for EMA200_4H
+          convergence. No trading occurs before 2019-01-01. No strategy logic changed."""
+          SYMBOLS = ["BTCUSDT", "ETHUSDT", "BNBUSDT", "SOLUSDT", "XRPUSDT", "ADAUSDT"]
+
+          DATA_START = "2018-01-01"
+          TRAIN = ("2019-01-01", "2022-12-31")
+          VALID = ("2023-01-01", "2023-12-31")
+          OOS = ("2024-01-01", None)
+
+          INITIAL_EQUITY = 10_000.0
+          RISK_PCT = 0.01
+          RISK_PCT_CONSERVATIVE = 0.005
+          MAX_OPEN_POSITIONS = 3
+          MAX_NOTIONAL_FRAC = 0.95
+
+          NS = 1_000_000_000
+          TF15 = 900 * NS
+          TF4H = 14_400 * NS
+          DAY = 86_400 * NS
+
+          BASE_PARAMS = dict(
+              version="V1.0-BASELINE",
+              pivot_lr=3, pivot_htf_lr=2,
+              atr_period=14, ema_fast=50, ema_slow=200,
+              zone_up=0.382, zone_low=0.618,
+              n_pb=40, n_conf=10,
+              sl_buf=0.5, tp_r=2.0,
+              sl_min_dist_pct=0.002, sl_max_dist_pct=0.03,
+              sweep_min_pen_pct=0.0005, sweep_min_pen_atr=0.05,
+              sweep_max_pen_pct=0.006, sweep_closeback=2,
+              eq_tol_pct=0.0015, eq_tol_atr=0.25,
+              trend_variant=1,
+              structure_exit=True,
+          )
+
+          COST_SCENARIOS = {
+              "optimistic":   dict(fee=0.0005, slip=0.0002, stop_slip=0.0010),
+              "realistic":    dict(fee=0.0010, slip=0.0005, stop_slip=0.0020),
+              "conservative": dict(fee=0.0015, slip=0.0010, stop_slip=0.0050),
+          }
+
+          GATES = dict(
+              oos_min_pf=1.15, oos_min_exp_r=0.05, oos_max_dd_pct=25.0,
+              wf_min_profitable=0.55, wf_min_cum_pf=1.05, wf_worst_window_min=-10.0,
+              sens_min_neighbor_profitable=0.60,
+              mc_p_maxdd30_max=0.05, mc_p_neg_max=0.20,
+              g7_min_symbols_pf_ge1=4, g7_min_symbol_pf=0.8,
+              stress_multiples=[1.0, 1.5, 2.0, 2.5, 3.0, 4.0, 5.0],
+          )
+          EOF
+          cat > data.py <<'EOF'
+          """Binance Spot public data download + mandatory Data Quality Audit. UTC only."""
+          import time, json
+          from pathlib import Path
+          import numpy as np
+          import pandas as pd
+          import requests
+          from config import SYMBOLS, DATA_START
+
+          URL = "https://api.binance.com/api/v3/klines"
+          COLS = ["open_time","open","high","low","close","volume","close_time",
+                  "qav","trades","tbb","tbq","ignore"]
+          STEP = {"15m": 900_000, "4h": 14_400_000}
+
+          def fetch(symbol, interval, start_ms, end_ms):
+              out, cur = [], start_ms
+              while cur < end_ms:
+                  params = dict(symbol=symbol, interval=interval, startTime=cur,
+                                endTime=end_ms, limit=1000)
+                  batch = None
+                  for attempt in range(6):
+                      try:
+                          r = requests.get(URL, params=params, timeout=30)
+                          r.raise_for_status()
+                          batch = r.json(); break
+                      except Exception:
+                          if attempt == 5: raise
+                          time.sleep(2 * (attempt + 1))
+                  if not batch: break
+                  out.extend(batch)
+                  cur = batch[-1][0] + 1
+                  if len(batch) < 1000: break
+                  time.sleep(0.12)
+              df = pd.DataFrame(out, columns=COLS)
+              if df.empty: return df
+              for c in ["open","high","low","close","volume"]:
+                  df[c] = pd.to_numeric(df[c], errors="coerce")
+              df["open_time"] = pd.to_numeric(df["open_time"])
+              df["close_time"] = pd.to_numeric(df["close_time"])
+              df = df[df["close_time"] <= end_ms]
+              df = df.drop_duplicates(subset="open_time").sort_values("open_time")
+              df.index = pd.to_datetime(df["open_time"], unit="ms")
+              return df[["open","high","low","close","volume","close_time"]]
+
+          def audit(df, interval):
+              step = STEP[interval]
+              ts = df.index.values.astype("datetime64[ns]").astype(np.int64) // 1_000_000
+              rep = {"first": str(df.index[0]), "last": str(df.index[-1]),
+                     "actual_candles": int(len(df)),
+                     "expected_if_contiguous": int((ts[-1] - ts[0]) // step + 1)}
+              rep["missing_candles"] = rep["expected_if_contiguous"] - rep["actual_candles"]
+              d = np.diff(ts); mask = d != step
+              rep["gap_count"] = int(mask.sum())
+              rep["gaps"] = [{"from": str(df.index[i]), "to": str(df.index[i+1]),
+                              "missing": int(d[i] // step - 1)} for i in np.where(mask)[0]][:200]
+              rep["duplicate_timestamps"] = int(df.index.duplicated().sum())
+              rep["out_of_order"] = int((d <= 0).sum())
+              bad = ((df["high"] < df["low"]) | (df["close"] > df["high"]) | (df["close"] < df["low"]) |
+                     (df["open"] > df["high"]) | (df["open"] < df["low"]) |
+                     (df[["open","high","low","close"]] <= 0).any(axis=1))
+              rep["invalid_ohlc"] = int(bad.sum())
+              rep["zero_volume_candles"] = int((df["volume"] == 0).sum())
+              rep["real_listing_start"] = str(df.index[0])
+              return rep
+
+          def download_all(raw_dir="data", symbols=None):
+              symbols = symbols or SYMBOLS
+              raw = Path(raw_dir); raw.mkdir(parents=True, exist_ok=True)
+              end_ms = int(pd.Timestamp.utcnow().timestamp() * 1000)
+              quality = {}
+              for s in symbols:
+                  for itv in ["15m", "4h"]:
+                      f = raw / f"{s}_{itv}.csv"
+                      start_ms = int(pd.Timestamp(DATA_START).timestamp() * 1000)
+                      df = fetch(s, itv, start_ms, end_ms)
+                      df.to_csv(f)
+                      quality[f"{s}_{itv}"] = audit(df, itv)
+                      print(f"[data] {s} {itv}: {len(df)} candles, "
+                            f"missing={quality[f'{s}_{itv}']['missing_candles']}")
+              (raw / "data_quality_report.json").write_text(json.dumps(quality, indent=2))
+              return quality
+
+          def load(raw_dir="data", symbols=None):
+              symbols = symbols or SYMBOLS
+              d15, d4 = {}, {}
+              for s in symbols:
+                  a = pd.read_csv(Path(raw_dir)/f"{s}_15m.csv", index_col=0, parse_dates=True)
+                  b = pd.read_csv(Path(raw_dir)/f"{s}_4h.csv",  index_col=0, parse_dates=True)
+                  d15[s], d4[s] = a, b
+              return d15, d4
+          EOF
+          cat > indicators.py <<'EOF'
+          """Causal indicators + strict pivots. Pivot usable only after R right candles closed."""
+          import numpy as np, pandas as pd
+
+          def ema(s, n):
+              return s.ewm(span=n, adjust=False).mean()
+
+          def wilder_atr(df, n=14):
+              h, l, c = df["high"], df["low"], df["close"]
+              pc = c.shift(1)
+              tr = pd.concat([h - l, (h - pc).abs(), (l - pc).abs()], axis=1).max(axis=1)
+              return tr.ewm(alpha=1.0 / n, adjust=False).mean()
+
+          def pivot_events(high, low, L, R):
+              h, l = high.to_numpy(float), low.to_numpy(float)
+              n = len(h); ev = []
+              for i in range(L, n - R):
+                  x = h[i]; ok = True
+                  for j in range(1, L + 1):
+                      if h[i - j] >= x: ok = False; break
+                  if ok:
+                      for j in range(1, R + 1):
+                          if h[i + j] >= x: ok = False; break
+                  if ok: ev.append((i + R, i, float(x), "PH"))
+                  x = l[i]; ok = True
+                  for j in range(1, L + 1):
+                      if l[i - j] <= x: ok = False; break
+                  if ok:
+                      for j in range(1, R + 1):
+                          if l[i + j] <= x: ok = False; break
+                  if ok: ev.append((i + R, i, float(x), "PL"))
+              ev.sort(key=lambda e: (e[0], e[1]))
+              return ev
+          EOF
+          cat > engine.py <<'EOF'
+          """MG Strategy Engine - v1.0-BASELINE logic. Event-driven, zero lookahead.
+          Fed ONLY closed 15m candles in order. Pivots time-gated: usable only after
+          their R right-hand candles have closed. Architecture forbids future access."""
+          from bisect import insort, bisect_right
+          import numpy as np
+          from indicators import ema, wilder_atr, pivot_events
+          from config import TF15, TF4H, DAY
+
+          SCAN, ARMED, PB, CONF, TRD = "SCAN","ARMED","PULLBACK_WAIT","ENTRY_CONFIRM_WAIT","IN_TRADE"
+
+          class Pool:
+              __slots__ = ("level", "source", "active")
+              def __init__(self, level, source):
+                  self.level = float(level); self.source = source; self.active = True
+
+          class Setup:
+              def __init__(self):
+                  self.ph_idx = -1; self.ph_price = 0.0; self.ph_conf_ts = 0
+                  self.pl_idx = -1; self.pl_price = 0.0
+                  self.bos_idx = -1; self.h_leg = 0.0; self.rng = 0.0
+                  self.zone_up = 0.0; self.zone_low = 0.0
+                  self.zone_touched = False; self.touch_ts = 0
+                  self.pools = []; self.slevels = []
+                  self.sweep = None; self.sweep_pend = None
+                  self.deadline = -1
+
+          class StrategyEngine:
+              def __init__(self, symbol, df15, df4, p):
+                  self.symbol = symbol; self.p = p
+                  self.t = df15.index.values.astype("datetime64[ns]").astype(np.int64)
+                  self.o = df15["open"].to_numpy(float);  self.h = df15["high"].to_numpy(float)
+                  self.l = df15["low"].to_numpy(float);   self.c = df15["close"].to_numpy(float)
+                  self.n = len(self.t)
+                  self.c4 = df4["close"].to_numpy(float)
+                  ef = ema(df4["close"], p["ema_fast"]); es = ema(df4["close"], p["ema_slow"])
+                  self.ef4 = ef.to_numpy(float); self.es4 = es.to_numpy(float)
+                  self.slope4 = (ef - ef.shift(180)).to_numpy(float)
+                  self.atr = wilder_atr(df15, p["atr_period"]).to_numpy(float)
+                  L = p["pivot_lr"]
+                  pv15 = pivot_events(df15["high"], df15["low"], L, L)
+                  self.pv15 = [(self.t[ci] + TF15, pi, pr, k) for (ci, pi, pr, k) in pv15]
+                  L4 = p["pivot_htf_lr"]
+                  pv4 = pivot_events(df4["high"], df4["low"], L4, L4)
+                  t4c = df4.index.values.astype("datetime64[ns]").astype(np.int64)
+                  self.pv4 = [(t4c[ci] + TF4H, pi, pr, k) for (ci, pi, pr, k) in pv4]
+                  self.state = SCAN; self.i15 = 0; self.i4 = 0; self._seq = 0
+                  self.trend_ok = False; self.struct_bull = False; self._last4 = None
+                  self.ph4 = []; self.pl4 = []
+                  self.ph15 = None; self.pl15 = None; self.pl_list = []
+                  self.pools = []; self.slevels = []
+                  self.pdl = None; self.pdl_day = -1; self.day_low = np.inf
+                  self.setup = None; self.pending = None
+                  self.block_until = -1
+                  self.last_close = np.nan
+                  self.audit = []
+
+              def log(self, idx, ev, **info):
+                  self.audit.append(dict(ts=str(self.t[idx]), symbol=self.symbol,
+                                         state=self.state, event=ev, **info))
+
+              def _register(self, pool):
+                  self._seq += 1
+                  insort(self.slevels, (pool.level, self._seq, pool))
+                  self.pools.append(pool)
+
+              def _add_pool(self, idx, level, source):
+                  tol = max(self.p["eq_tol_pct"] * level, self.p["eq_tol_atr"] * self.atr[idx])
+                  for _, q in self.slevels:
+                      if q.active and abs(q.level - level) <= tol:
+                          return
+                  self._register(Pool(level, source))
+
+              def _add_pl_pools(self, idx, price):
+                  self._add_pool(idx, price, "PL")
+                  tol = max(self.p["eq_tol_pct"] * price, self.p["eq_tol_atr"] * self.atr[idx])
+                  for pi2, pr2 in reversed(self.pl_list[:-1]):
+                      if abs(pr2 - price) <= tol:
+                          self._add_pool(idx, (pr2 + price) / 2.0, "EQ")
+                          break
+
+              def _last_pl_before(self, ph_idx):
+                  for pi, pr in reversed(self.pl_list):
+                      if pi < ph_idx:
+                          return (pi, pr)
+                  return None
+
+              def _snapshot_pools(self, idx):
+                  cap = self.c[idx] * 1.5
+                  pools, sl, seq0 = [], [], self._seq
+                  j = bisect_right(self.slevels, (-np.inf, 10**18, None))
+                  for lv, _, q in self.slevels[j:]:
+                      if lv > cap: break
+                      if q.active and lv < self.c[idx]:
+                          p = Pool(lv, q.source); pools.append(p)
+                          seq0 += 1; sl.append((lv, seq0, p))
+                  sl.sort(key=lambda x: x[0])
+                  return pools, sl
+
+              def _invalidate(self, idx, reason):
+                  self.log(idx, "SETUP_INVALID", reason=reason)
+                  self.state = SCAN; self.setup = None; self.pending = None
+                  self.block_until = int(self.t[idx]) + TF15
+
+              def _expire(self, idx):
+                  self.log(idx, "SETUP_EXPIRED", reason="no_confirmation")
+                  self.state = SCAN; self.setup = None
+                  self.block_until = int(self.t[idx]) + TF15
+
+              def _sweep_confirm(self, idx, sp):
+                  su = self.setup
+                  su.sweep = dict(level=sp["level"], pen=sp["pen"], sweep_ts=int(self.t[idx]),
+                                  conf_ts=int(self.t[idx]), source=sp["source"])
+                  su.sweep_pend = None
+                  sp["pool"].active = False
+                  self.log(idx, "SWEEP_CONFIRM", level=sp["level"], pen=sp["pen"])
+
+              def _try_conf(self, idx):
+                  su = self.setup
+                  if su and su.zone_touched and su.sweep is not None and self.state == PB:
+                      self.state = CONF; su.deadline = idx + self.p["n_conf"]
+                      self.log(idx, "ENTRY_CONFIRM_WAIT", deadline=su.deadline)
+                      if self.c[idx] > su.sweep["level"] and self.c[idx] > self.o[idx]:
+                          self._emit_signal(idx)
+
+              def _scan_sweeps(self, idx):
+                  su = self.setup
+                  lo = self.l[idx]; close = self.c[idx]
+                  j = bisect_right(su.slevels, (lo, 10**18, None))
+                  for lv, _, pool in su.slevels[j:]:
+                      if lv > close * 1.5: break
+                      if not pool.active: continue
+                      pen = lv - lo
+                      if pen > lv * self.p["sweep_max_pen_pct"]:
+                          self._invalidate(idx, "sweep_max_pen_breach"); return
+                      min_pen = max(lv * self.p["sweep_min_pen_pct"],
+                                    self.p["sweep_min_pen_atr"] * self.atr[idx])
+                      if pen >= min_pen:
+                          if su.sweep_pend is None:
+                              su.sweep_pend = dict(pool=pool, level=lv, pen=pen,
+                                                   idx=idx, source=pool.source)
+                              self.log(idx, "SWEEP_PENDING", level=lv, pen=pen)
+                              if close > lv:
+                                  self._sweep_confirm(idx, su.sweep_pend)
+                                  self._try_conf(idx); return
+                          break
+
+              def _emit_signal(self, idx):
+                  su = self.setup
+                  setup_low = float(np.min(self.l[su.bos_idx + 1: idx + 1]))
+                  sl = setup_low - self.p["sl_buf"] * self.atr[idx]
+                  if not (sl < self.c[idx]):
+                      self._invalidate(idx, "bad_sl"); return
+                  self.pending = dict(
+                      sig_idx=idx, sig_ts=int(self.t[idx]), sl=sl, setup_low=setup_low,
+                      level=su.sweep["level"], pen=su.sweep["pen"], source=su.sweep["source"],
+                      zone_up=su.zone_up, zone_low=su.zone_low, touch_ts=su.touch_ts,
+                      sweep_ts=su.sweep["sweep_ts"], pl_price=su.pl_price,
+                      ph_price=su.ph_price, h_leg=su.h_leg, bos_ts=int(self.t[su.bos_idx]),
+                      checklist=dict(trend=True, struct=True, pivot=True, bos=True,
+                                     pullback=True, sweep=True, confirm=True))
+                  self.log(idx, "ENTRY_SIGNAL", sl=sl, level=su.sweep["level"])
+
+              def validate_fill(self, fill_price):
+                  if self.pending is None: return False, "no_signal"
+                  d = (fill_price - self.pending["sl"]) / fill_price
+                  if not (self.p["sl_min_dist_pct"] <= d <= self.p["sl_max_dist_pct"]):
+                      return False, "sl_distance_filter"
+                  if not (self.trend_ok and self.struct_bull):
+                      return False, "trend_or_struct_lost_at_entry"
+                  return True, "ok"
+
+              def confirm_entry(self):
+                  self.state = TRD
+                  meta = self.pending; self.pending = None
+                  return meta
+
+              def reject(self, ts_close_ns, reason):
+                  self.audit.append(dict(ts=str(ts_close_ns), symbol=self.symbol,
+                                         state=self.state, event="ENTRY_REJECTED",
+                                         reason=reason))
+                  self.state = SCAN; self.setup = None; self.pending = None
+                  self.block_until = ts_close_ns
+
+              def on_position_closed(self, ts_close_ns):
+                  self.state = SCAN; self.setup = None; self.pending = None
+                  self.block_until = ts_close_ns
+
+              def feed(self, idx, live=True):
+                  T = int(self.t[idx]); now_close = T + TF15
+                  day = T // DAY
+                  if day != self.pdl_day:
+                      if self.pdl_day >= 0 and np.isfinite(self.day_low):
+                          if self.pdl is not None: self.pdl.active = False
+                          self.pdl = Pool(self.day_low, "PDL"); self._register(self.pdl)
+                      self.pdl_day = day; self.day_low = np.inf
+                  self.day_low = min(self.day_low, self.l[idx])
+                  on4 = (T % TF4H == 0)
+                  if on4:
+                      k = T // TF4H - 1
+                      if 0 <= k < len(self.c4): self._last4 = k
+                  while self.i4 < len(self.pv4) and self.pv4[self.i4][0] <= now_close:
+                      _, pi, pr, kd = self.pv4[self.i4]; self.i4 += 1
+                      hist = self.ph4 if kd == "PH" else self.pl4
+                      hist.append((pi, pr))
+                      if len(hist) > 2: hist.pop(0)
+                  if len(self.ph4) == 2 and len(self.pl4) == 2:
+                      self.struct_bull = (self.ph4[1][1] > self.ph4[0][1]) and \
+                                         (self.pl4[1][1] > self.pl4[0][1])
+                  if on4 and self._last4 is not None:
+                      k = self._last4; c4 = self.c4[k]
+                      f, s = self.ef4[k], self.es4[k]
+                      if self.p["trend_variant"] == 2:   self.trend_ok = c4 > s
+                      elif self.p["trend_variant"] == 3: self.trend_ok = (f > s) and (c4 > f) \
+                                                                          and (self.slope4[k] > 0)
+                      else:                              self.trend_ok = (f > s) and (c4 > f)
+                      if self.state in (ARMED, PB, CONF):
+                          if not self.trend_ok:            self._invalidate(idx, "trend_lost_4h")
+                          elif not self.struct_bull:       self._invalidate(idx, "structure_lost_4h")
+                          elif self.pl4 and c4 < self.pl4[-1][1]:
+                                                           self._invalidate(idx, "4h_close_below_PL4")
+                  while self.i15 < len(self.pv15) and self.pv15[self.i15][0] <= now_close:
+                      _, pi, pr, kd = self.pv15[self.i15]; self.i15 += 1
+                      if kd == "PH":
+                          self.ph15 = (pi, pr)
+                          if (self.state == SCAN and T > self.block_until
+                                  and self.trend_ok and self.struct_bull):
+                              leg = self._last_pl_before(pi)
+                              if leg is not None:
+                                  su = Setup()
+                                  su.ph_idx, su.ph_price = pi, pr
+                                  su.ph_conf_ts = self.pv15[self.i15 - 1][0]
+                                  su.pl_idx, su.pl_price = leg
+                                  self.setup = su; self.state = ARMED
+                                  self.log(idx, "ARMED", ph=pr, pl=su.pl_price)
+                      else:
+                          self.pl15 = (pi, pr)
+                          self.pl_list.append((pi, pr))
+                          if len(self.pl_list) > 60: del self.pl_list[:-60]
+                          self._add_pl_pools(idx, pr)
+                  if self.pending is not None:
+                      return None
+                  su = self.setup
+                  if su is not None and self.state in (ARMED, PB, CONF):
+                      if self.c[idx] < su.pl_price:
+                          self._invalidate(idx, "structure_break_15m"); return None
+                  if self.state == ARMED and su is not None:
+                      if self.c[idx] > su.ph_price:
+                          su.bos_idx = idx
+                          su.h_leg = float(np.max(self.h[su.pl_idx: idx + 1]))
+                          su.rng = su.h_leg - su.pl_price
+                          su.zone_up  = su.h_leg - self.p["zone_up"]  * su.rng
+                          su.zone_low = su.h_leg - self.p["zone_low"] * su.rng
+                          su.pools, su.slevels = self._snapshot_pools(idx)
+                          su.sweep = None; su.sweep_pend = None; su.zone_touched = False
+                          self.state = PB
+                          self.log(idx, "BOS", level=su.ph_price, h_leg=su.h_leg)
+                      return None
+                  if self.state == PB and su is not None:
+                      if idx - su.bos_idx > self.p["n_pb"]:
+                          self._invalidate(idx, "pb_timeout"); return None
+                      if su.sweep_pend is not None:
+                          sp = su.sweep_pend
+                          if self.c[idx] > sp["level"]:
+                              self._sweep_confirm(idx, sp)
+                          elif idx - sp["idx"] >= self.p["sweep_closeback"]:
+                              sp["pool"].active = False; su.sweep_pend = None
+                              self.audit.append(dict(ts=str(self.t[idx]), symbol=self.symbol,
+                                                     state=self.state, event="SWEEP_FAILED",
+                                                     level=sp["level"]))
+                      if self.state == PB:
+                          self._scan_sweeps(idx)
+                      if self.state == PB and su is not None and not su.zone_touched \
+                              and self.l[idx] <= su.zone_up:
+                          su.zone_touched = True; su.touch_ts = int(self.t[idx])
+                          self.log(idx, "ZONE_TOUCH", zone_up=su.zone_up)
+                      if live:
+                          self._try_conf(idx)
+                      return None
+                  if self.state == CONF and su is not None:
+                      if su.sweep is not None and \
+                         self.c[idx] < su.sweep["level"] * (1 - self.p["sweep_max_pen_pct"]):
+                          self._invalidate(idx, "sweep_level_break"); return None
+                      if self.c[idx] > su.sweep["level"] and self.c[idx] > self.o[idx]:
+                          if live: self._emit_signal(idx)
+                          return None
+                      if idx > su.deadline:
+                          self._expire(idx)
+                      return None
+                  return None
+          EOF
+          cat > portfolio.py <<'EOF'
+          """Risk-based portfolio: sizing, fees, slippage, equity marking, Trade Log."""
+          import pandas as pd
+          from config import INITIAL_EQUITY, MAX_NOTIONAL_FRAC
+
+          class Portfolio:
+              def __init__(self, cost, risk_pct, version):
+                  self.cost = cost; self.risk_pct = risk_pct; self.version = version
+                  self.cash = INITIAL_EQUITY
+                  self.positions = {}
+                  self.trades = []
+                  self.fees_total = 0.0; self.slip_total = 0.0
+                  self._ids = 0
+
+              def open_from_engine(self, symbol, ts_ns, raw_open, engine, params):
+                  c = self.cost
+                  entry = raw_open * (1 + c["slip"])
+                  sl = engine.pending["sl"]
+                  risk_amt0 = self.equity() * self.risk_pct
+                  size = risk_amt0 / max(entry - sl, 1e-12)
+                  max_not = MAX_NOTIONAL_FRAC * self.equity()
+                  if size * entry > max_not:
+                      size = max_not / entry
+                  risk_amt = size * (entry - sl)
+                  fee_in = size * entry * c["fee"]
+                  self.cash -= size * entry + fee_in
+                  self.fees_total += fee_in
+                  self.slip_total += size * raw_open * c["slip"]
+                  tp = entry + params["tp_r"] * (entry - sl)
+                  self._ids += 1
+                  meta = engine.pending
+                  pos = dict(setup_id=f"{symbol}-{meta['sig_idx']}-{self._ids}",
+                             symbol=symbol, entry_ns=ts_ns, entry_fill=entry, sl=sl, tp=tp,
+                             size=size, risk_pct=self.risk_pct, risk_amount=risk_amt,
+                             fee_in=fee_in, pl15=meta["pl_price"], meta=meta)
+                  self.positions[symbol] = pos
+                  engine.confirm_entry()
+                  return pos
+
+              def equity(self):
+                  return self.cash + sum(p["size"] * p.get("mark", p["entry_fill"])
+                                         for p in self.positions.values())
+
+              def mark(self, marks):
+                  for s, p in self.positions.items():
+                      p["mark"] = marks.get(s, p.get("mark", p["entry_fill"]))
+                  return self.cash + sum(p["size"] * p["mark"] for p in self.positions.values())
+
+              def close(self, symbol, ts_ns, raw_fill, reason, stop, engine, params):
+                  p = self.positions.pop(symbol)
+                  c = self.cost
+                  fill = raw_fill * (1 - c["slip"])
+                  if stop: fill *= (1 - c["stop_slip"])
+                  fee_out = p["size"] * fill * c["fee"]
+                  slip_cost = p["size"] * raw_fill * c["slip"] + \
+                              (p["size"] * raw_fill * c["stop_slip"] if stop else 0.0)
+                  self.cash += p["size"] * fill - fee_out
+                  self.fees_total += fee_out; self.slip_total += slip_cost
+                  pnl = p["size"] * (fill - p["entry_fill"]) - p["fee_in"] - fee_out
+                  r = pnl / p["risk_amount"] if p["risk_amount"] > 0 else 0.0
+                  m = p["meta"]; ck = m["checklist"]
+                  self.trades.append(dict(
+                      setup_id=p["setup_id"], symbol=symbol,
+                      timestamp_entry=str(pd.Timestamp(p["entry_ns"])),
+                      entry_ns=p["entry_ns"], exit_ns=ts_ns,
+                      trend_pass=ck["trend"], struct_pass=ck["struct"], pivot_pass=ck["pivot"],
+                      bos_pass=ck["bos"], pullback_pass=ck["pullback"], sweep_pass=ck["sweep"],
+                      confirm_pass=ck["confirm"],
+                      zone_up=m["zone_up"], zone_low=m["zone_low"], touch_ts=m["touch_ts"],
+                      level_L=m["level"], pen_depth=m["pen"], liq_source=m["source"],
+                      sweep_ts=m["sweep_ts"], closeback_ts=m["sweep_ts"],
+                      confirm_ts=m["sig_ts"], entry_ts=p["entry_ns"],
+                      entry_price=p["entry_fill"], sl_price=p["sl"],
+                      dist_to_sl=p["entry_fill"] - p["sl"], tp_price=p["tp"],
+                      risk_pct=p["risk_pct"], risk_amount=p["risk_amount"],
+                      position_size=p["size"],
+                      exit_ts=ts_ns, exit_price=fill, exit_reason=reason,
+                      fees=p["fee_in"] + fee_out, slippage=slip_cost,
+                      pnl=pnl, pnl_pct=100 * pnl / (p["size"] * p["entry_fill"]),
+                      r_multiple=r))
+                  engine.on_position_closed(ts_ns + 900_000_000)
+          EOF
+          cat > backtest.py <<'EOF'
+          """Event-driven backtester. Only clock = close of 15m candles.
+          SL and TP both touched in one candle -> SL first (conservative).
+          Open gaps past SL/TP -> fill at open. Entry always next candle open."""
+          import numpy as np
+          from engine import StrategyEngine
+          from portfolio import Portfolio
+          from config import SYMBOLS, MAX_OPEN_POSITIONS
+
+          def run_backtest(data15, data4, params, cost, risk_pct=0.01,
+                           warm_from=None, trading_from=None, end=None):
+              engs = {s: StrategyEngine(s, data15[s], data4[s], params) for s in data15}
+              pf = Portfolio(cost, risk_pct, params["version"])
+              ptr = {s: 0 for s in engs}
+              pend_e, pend_x = {}, set()
+              times = np.unique(np.concatenate([e.t for e in engs.values()]))
+              if warm_from is not None:
+                  times = times[times >= np.datetime64(warm_from)]
+              if end is not None:
+                  times = times[times <= np.datetime64(end)]
+              tf_ns = None if trading_from is None else \
+                  np.datetime64(trading_from).astype("datetime64[ns]").astype(np.int64)
+              curve_t, curve_v = [], []
+              order = [s for s in SYMBOLS if s in engs]
+
+              for tn in times:
+                  tn_ns = int(tn.astype("datetime64[ns]").astype(np.int64))
+                  live = (tf_ns is None) or (tn_ns >= tf_ns)
+
+                  def has(s):
+                      e = engs[s]; p = ptr[s]
+                      return p < e.n and e.t[p] == tn
+
+                  for s in [x for x in order if x in pend_x]:
+                      if has(s):
+                          e = engs[s]
+                          pf.close(s, tn_ns, e.o[ptr[s]], "STRUCT_EXIT", False, e, params)
+                          pend_x.discard(s)
+                  for s in order:
+                      if s in pend_e and has(s) and live:
+                          e = engs[s]; raw = e.o[ptr[s]]
+                          ok, reason = e.validate_fill(raw)
+                          cap = len(pf.positions) < MAX_OPEN_POSITIONS and s not in pf.positions
+                          if ok and cap:
+                              pf.open_from_engine(s, tn_ns, raw, e, params)
+                          else:
+                              e.reject(tn_ns + 900_000_000, reason if not ok else "capacity")
+                          pend_e.pop(s, None)
+                  for s in order:
+                      e = engs[s]; p_ = ptr[s]
+                      while p_ < e.n and e.t[p_] < tn: p_ += 1
+                      ptr[s] = p_
+                      if p_ < e.n and e.t[p_] == tn:
+                          e.feed(p_, live=live)
+                          e.last_close = e.c[p_]
+                          if live and e.pending is not None:
+                              pend_e[s] = True
+                  if live:
+                      for s in list(pf.positions):
+                          if not has(s): continue
+                          e = engs[s]; i = ptr[s]; pos = pf.positions[s]
+                          if e.l[i] <= pos["sl"]:
+                              pf.close(s, tn_ns, min(e.o[i], pos["sl"]), "SL", True, e, params)
+                          elif e.h[i] >= pos["tp"]:
+                              pf.close(s, tn_ns, max(e.o[i], pos["tp"]), "TP", False, e, params)
+                          elif params["structure_exit"] and e.c[i] < pos["pl15"]:
+                              pend_x.add(s)
+                      marks = {s: engs[s].last_close for s in pf.positions}
+                      curve_t.append(tn_ns); curve_v.append(pf.mark(marks))
+              audits = {s: e.audit for s, e in engs.items()}
+              return dict(trades=pf.trades, curve_t=curve_t, curve_v=curve_v,
+                          audits=audits, fees=pf.fees_total, slippage=pf.slip_total)
+          EOF
+          cat > metrics.py <<'EOF'
+          """Performance metrics + regime tagging. Computed only from real run outputs."""
+          import numpy as np, pandas as pd
+          from indicators import ema, wilder_atr
+          from config import INITIAL_EQUITY
+
+          def _empty():
+              return dict(Total_Trades=0, Net_Profit=0.0, Net_Return_pct=0.0, Profit_Factor=0.0,
+                          Win_Rate_pct=0.0, Avg_Win=0.0, Avg_Loss=0.0, Expectancy_USD=0.0,
+                          Expectancy_R=0.0, Max_Drawdown_pct=0.0, Sharpe=0.0, Sortino=0.0,
+                          Max_Consec_Wins=0, Max_Consec_Losses=0, Exposure_pct=0.0,
+                          Trades_per_Month=0.0, Fees_Paid=0.0, Slippage_Cost=0.0)
+
+          def compute(trades, curve_t=None, curve_v=None, initial=INITIAL_EQUITY):
+              out = _empty(); n = len(trades)
+              out["Total_Trades"] = n
+              if n == 0: return out
+              pnl = np.array([t["pnl"] for t in trades])
+              r = np.array([t["r_multiple"] for t in trades])
+              wins, losses = pnl[pnl > 0], pnl[pnl <= 0]
+              gw, gl = wins.sum(), abs(losses.sum())
+              out.update(Net_Profit=float(pnl.sum()), Net_Return_pct=100 * float(pnl.sum()) / initial,
+                         Profit_Factor=float(gw / gl) if gl > 0 else float("inf"),
+                         Win_Rate_pct=100 * len(wins) / n,
+                         Avg_Win=float(wins.mean()) if len(wins) else 0.0,
+                         Avg_Loss=float(losses.mean()) if len(losses) else 0.0,
+                         Expectancy_USD=float(pnl.mean()), Expectancy_R=float(r.mean()),
+                         Fees_Paid=float(sum(t["fees"] for t in trades)),
+                         Slippage_Cost=float(sum(t["slippage"] for t in trades)))
+              if curve_t and len(curve_t) > 1:
+                  eq = pd.Series(curve_v, index=pd.to_datetime(curve_t))
+                  peak = eq.cummax()
+                  out["Max_Drawdown_pct"] = float(100 * ((peak - eq) / peak).max())
+                  daily = eq.resample("1D").last().dropna()
+                  ret = daily.pct_change().dropna()
+                  sd = ret.std()
+                  out["Sharpe"] = float(ret.mean() / sd * np.sqrt(365)) if sd > 0 else 0.0
+                  dn = ret[ret < 0]; dsd = dn.std()
+                  out["Sortino"] = float(ret.mean() / dsd * np.sqrt(365)) if dsd and dsd > 0 else 0.0
+                  span_days = (eq.index[-1] - eq.index[0]).days or 1
+              else:
+                  span_days = max((trades[-1]["exit_ns"] - trades[0]["entry_ns"])
+                                  / 86_400_000_000_000, 1)
+              mw = ml = cw = cl = 0
+              for x in pnl:
+                  if x > 0: cw += 1; cl = 0; mw = max(mw, cw)
+                  else:     cl += 1; cw = 0; ml = max(ml, cl)
+              out["Max_Consec_Wins"], out["Max_Consec_Losses"] = mw, ml
+              inpos = sum(t["exit_ns"] - t["entry_ns"] for t in trades)
+              total = span_days * 86_400 * 1_000_000_000
+              out["Exposure_pct"] = 100 * inpos / total
+              out["Trades_per_Month"] = n / (span_days / 30.44)
+              return out
+
+          def per_symbol(trades):
+              res = {}
+              for s in sorted({t["symbol"] for t in trades}):
+                  tt = [t for t in trades if t["symbol"] == s]
+                  m = compute(tt)
+                  pnl = np.cumsum([t["pnl"] for t in tt])
+                  eq = INITIAL_EQUITY + pnl
+                  peak = np.maximum.accumulate(np.maximum(eq, INITIAL_EQUITY))
+                  m["Max_Drawdown_pct"] = float(100 * ((peak - eq) / peak).max()) if len(eq) else 0.0
+                  res[s] = m
+              return res
+
+          def build_regimes(data4, data15):
+              tab, vols = {}, []
+              for s in data4:
+                  df4 = data4[s]; ef = ema(df4["close"], 200); slope = ef - ef.shift(180)
+                  bull = (df4["close"] > ef) & (slope > 0); bear = (df4["close"] < ef) & (slope < 0)
+                  per = df4.index.to_period("M")
+                  last_idx = {}
+                  for i in range(len(df4)): last_idx[per[i]] = i
+                  a = wilder_atr(data15[s], 14) / data15[s]["close"]
+                  av = a.groupby(data15[s].index.to_period("M")).mean()
+                  for m, i in last_idx.items():
+                      reg = "Bull" if bull.iloc[i] else ("Bear" if bear.iloc[i] else "Range")
+                      v = float(av.get(m, np.nan))
+                      tab[(s, str(m))] = (reg, v)
+                      if np.isfinite(v): vols.append(v)
+              q1, q2 = np.quantile(vols, [1/3, 2/3])
+              out = {}
+              for k, (reg, v) in tab.items():
+                  vol = "Low" if v < q1 else ("Medium" if v < q2 else "High")
+                  out[k] = (reg, vol)
+              return out, (q1, q2)
+
+          def tag_trades(trades, regtab):
+              for t in trades:
+                  m = str(pd.Timestamp(t["entry_ns"]).to_period("M"))
+                  reg, vol = regtab.get((t["symbol"], m), ("Unknown", "Unknown"))
+                  t["regime"] = reg; t["vol_regime"] = vol
+              return trades
+
+          def per_regime(trades):
+              res = {}
+              for key in sorted({(t["regime"], t["vol_regime"]) for t in trades}):
+                  tt = [t for t in trades if (t["regime"], t["vol_regime"]) == key]
+                  res[f"{key[0]}/{key[1]}"] = compute(tt)
+              return res
+          EOF
+          cat > walkforward.py <<'EOF'
+          """Walk-Forward on Train+Validation ONLY. OOS never touched here.
+          9 combos (tpR x sl_buf) run once over 2019-2023; window slicing exact."""
+          import itertools, json
+          import pandas as pd
+          from backtest import run_backtest
+          from metrics import compute
+          from config import TRAIN, VALID
+
+          GRID = [dict(tp_r=a, sl_buf=b) for a, b in itertools.product((1.5, 2.0, 2.5), (0.25, 0.5, 0.75))]
+
+          def _months(y0, m0, k):
+              t = y0 * 12 + (m0 - 1) + k
+              return t // 12, t % 12 + 1
+
+          def windows():
+              out, k = [], 0
+              while True:
+                  y0, m0 = _months(2019, 1, k);            y1, m1 = _months(2019, 1, k + 18)
+                  y2, m2 = _months(2019, 1, k + 18);       y3, m3 = _months(2019, 1, k + 21)
+                  ts = f"{y1}-{m1:02d}-01"; te = f"{y2}-{m2:02d}-01"
+                  if y2 > 2023 or (y2 == 2023 and m2 > 12):
+                      te = "2024-01-01"
+                      out.append(dict(train_start=f"{y0}-{m0:02d}-01", train_end=ts,
+                                      test_start=ts, test_end=te)); break
+                  out.append(dict(train_start=f"{y0}-{m0:02d}-01", train_end=ts,
+                                  test_start=ts, test_end=te))
+                  k += 3
+              return out
+
+          def _slice(trades, a, b):
+              a = int(pd.Timestamp(a).value)
+              b = int(pd.Timestamp(b).value)
+              return [t for t in trades if a <= t["entry_ns"] < b]
+
+          def run(data15, data4, base, cost):
+              runs = {}
+              for g in GRID:
+                  p = dict(base); p.update(g); p["version"] = base["version"] + f"|wf{g}"
+                  r = run_backtest(data15, data4, p, cost,
+                                   warm_from="2018-01-01", trading_from=TRAIN[0],
+                                   end=VALID[1] + " 23:59:59")
+                  runs[g["tp_r"], g["sl_buf"]] = r["trades"]
+                  print(f"[wf-grid] tpR={g['tp_r']} sl_buf={g['sl_buf']} trades={len(r['trades'])}")
+              report, test_all, chosen_list = [], [], []
+              for w in windows():
+                  best, best_v, fallback = None, -1e9, False
+                  for key, tr in runs.items():
+                      trn = _slice(tr, w["train_start"], w["train_end"])
+                      m = compute(trn)
+                      if m["Total_Trades"] >= 20 and 0 < m["Profit_Factor"] < float("inf") \
+                         and m["Profit_Factor"] >= 1.1:
+                          if m["Expectancy_R"] > best_v:
+                              best_v, best = m["Expectancy_R"], key
+                  if best is None:
+                      fallback = True
+                      for key, tr in runs.items():
+                          m = compute(_slice(tr, w["train_start"], w["train_end"]))
+                          if m["Total_Trades"] >= 10 and m["Expectancy_R"] > best_v:
+                              best_v, best = m["Expectancy_R"], key
+                      if best is None: best = (2.0, 0.5)
+                  tr_te = _slice(runs[best], w["test_start"], w["test_end"])
+                  mte = compute(tr_te)
+                  test_all += tr_te; chosen_list.append(best)
+                  report.append(dict(window=w, chosen=dict(tp_r=best[0], sl_buf=best[1]),
+                                     fallback=fallback, **{k2: mte[k2] for k2 in
+                                     ("Total_Trades","Net_Return_pct","Profit_Factor",
+                                      "Expectancy_R","Max_Drawdown_pct")}))
+                  print(f"[wf] {w['test_start']} -> chosen={best} "
+                        f"ret={mte['Net_Return_pct']:.2f}% pf={mte['Profit_Factor']:.2f}")
+              prof = sum(1 for r in report if r["Net_Return_pct"] > 0)
+              agg = compute(test_all)
+              return dict(n_windows=len(report), profitable=prof, losing=len(report) - prof,
+                          windows=report, aggregate=agg,
+                          param_stability={str(k): chosen_list.count(k) for k in set(chosen_list)},
+                          worst_window=min((r["Net_Return_pct"] for r in report), default=0.0))
+          EOF
+          cat > sensitivity.py <<'EOF'
+          """One-factor-at-a-time Sensitivity on Validation.
+          OVERFIT WARNING if profitable-neighbor share < gate threshold."""
+          from backtest import run_backtest
+          from metrics import compute
+          from config import VALID
+
+          VARIANTS = []
+          for v in (2, 4, 5):                        VARIANTS.append((f"pivot_lr={v}", dict(pivot_lr=v)))
+          for v in (0.25, 0.75, 1.0):                VARIANTS.append((f"sl_buf={v}", dict(sl_buf=v)))
+          for v in (1.5, 2.5, 3.0):                  VARIANTS.append((f"tp_r={v}", dict(tp_r=v)))
+          for v in (24, 56, 72):                     VARIANTS.append((f"n_pb={v}", dict(n_pb=v)))
+          for v in (2, 3):                           VARIANTS.append((f"trend_variant={v}", dict(trend_variant=v)))
+          VARIANTS += [("zone_band-0.05", dict(zone_up=0.332, zone_low=0.568)),
+                       ("zone_band+0.05", dict(zone_up=0.432, zone_low=0.668)),
+                       ("sweep_max_pen=0.004", dict(sweep_max_pen_pct=0.004)),
+                       ("sweep_max_pen=0.008", dict(sweep_max_pen_pct=0.008)),
+                       ("sweep_min_atr=0.03", dict(sweep_min_pen_atr=0.03)),
+                       ("sweep_min_atr=0.07", dict(sweep_min_pen_atr=0.07))]
+
+          def run(data15, data4, base, cost):
+              warm = "2022-10-01"
+              rows = []
+              p0 = dict(base)
+              r0 = run_backtest(data15, data4, p0, cost, warm_from=warm,
+                                trading_from=VALID[0], end=VALID[1] + " 23:59:59")
+              base_m = compute(r0["trades"])
+              rows.append(dict(variant="BASELINE", **{k: base_m[k] for k in
+                  ("Total_Trades","Net_Return_pct","Profit_Factor","Expectancy_R")}))
+              print(f"[sens] BASELINE pf={base_m['Profit_Factor']:.2f} "
+                    f"ret={base_m['Net_Return_pct']:.2f}%")
+              for name, chg in VARIANTS:
+                  p = dict(base); p.update(chg); p["version"] = base["version"] + "|sens:" + name
+                  r = run_backtest(data15, data4, p, cost, warm_from=warm,
+                                   trading_from=VALID[0], end=VALID[1] + " 23:59:59")
+                  m = compute(r["trades"])
+                  rows.append(dict(variant=name, **{k: m[k] for k in
+                      ("Total_Trades","Net_Return_pct","Profit_Factor","Expectancy_R")}))
+                  print(f"[sens] {name}: pf={m['Profit_Factor']:.2f} ret={m['Net_Return_pct']:.2f}%")
+              neigh = [r for r in rows if r["variant"] != "BASELINE"]
+              prof_n = sum(1 for r in neigh if r["Net_Return_pct"] > 0)
+              share = prof_n / len(neigh) if neigh else 0.0
+              return dict(rows=rows, neighbors_total=len(neigh), neighbors_profitable=prof_n,
+                          profitable_neighbor_share=share,
+                          overfit_warning=share < 0.60)
+          EOF
+          cat > monte_carlo.py <<'EOF'
+          """Monte Carlo on REAL OOS trades only. IID + block bootstrap (block=5)."""
+          import numpy as np
+
+          def simulate(r, risk_pct, n_paths=10_000, block=5, seed=7):
+              r = np.asarray([x for x in r if np.isfinite(x)], float)
+              N = len(r)
+              if N == 0:
+                  return dict(n_trades=0)
+              rng = np.random.default_rng(seed)
+              def stats(paths_r):
+                  eq = np.cumprod(1 + risk_pct * paths_r, axis=1)
+                  peak = np.maximum.accumulate(np.concatenate(
+                      [np.ones((eq.shape[0], 1)), eq], axis=1), axis=1)[:, 1:]
+                  dd = (peak - eq) / peak
+                  mdd = dd.max(axis=1); final = eq[:, -1]
+                  return dict(n_trades=N, n_paths=n_paths,
+                              ret_p5=float(np.percentile(final, 5) - 1),
+                              ret_p50=float(np.percentile(final, 50) - 1),
+                              ret_p95=float(np.percentile(final, 95) - 1),
+                              maxdd_p50=float(np.percentile(mdd, 50)),
+                              maxdd_p95=float(np.percentile(mdd, 95)),
+                              maxdd_p99=float(np.percentile(mdd, 99)),
+                              p_maxdd_gt_20=float((mdd > 0.20).mean()),
+                              p_maxdd_gt_30=float((mdd > 0.30).mean()),
+                              p_return_lt_0=float((final < 1).mean()))
+              iid = rng.choice(r, size=(n_paths, N))
+              out = dict(iid=stats(iid))
+              nblocks = int(np.ceil(N / block))
+              starts = rng.integers(0, N, size=(n_paths, nblocks))
+              idx = (starts[:, :, None] + np.arange(block)[None, None, :]) % N
+              blk = r[idx.reshape(n_paths, -1)[:, :N]]
+              out["block"] = stats(blk)
+              return out
+          EOF
+          cat > reports.py <<'EOF'
+          """All reports, Trade Log CSV, Experiment Log CSV, Gate evaluation."""
+          import json, csv
+          from pathlib import Path
+          import pandas as pd
+          from config import GATES
+
+          def ensure_dirs():
+              for d in ["outputs/baseline","outputs/walkforward","outputs/sensitivity",
+                        "outputs/oos","outputs/logs"]:
+                  Path(d).mkdir(parents=True, exist_ok=True)
+
+          def save_trades(trades, path):
+              if trades:
+                  pd.DataFrame(trades).to_csv(path, index=False)
+              else:
+                  pd.DataFrame([{"note": "no trades"}]).to_csv(path, index=False)
+
+          def save_metrics(d, path):
+              Path(path).write_text(json.dumps(d, indent=2, default=str))
+
+          def append_experiment_log(entry, path="outputs/logs/experiment_log.csv"):
+              p = Path(path); exists = p.exists()
+              cols = ["Version","Date","Changes","Reason","Train_Result","Validation_Result",
+                      "WF_Result","OOS_Result","Decision"]
+              row = {c: entry.get(c, "") for c in cols}
+              with open(p, "a", newline="") as f:
+                  w = csv.DictWriter(f, fieldnames=cols)
+                  if not exists: w.writeheader()
+                  w.writerow(row)
+
+          def evaluate_gates(oos, wf, sens, mc, per_sym, stress):
+              g = {}
+              g["G1_oos"] = (oos["Net_Return_pct"] > 0 and oos["Profit_Factor"] >= GATES["oos_min_pf"]
+                             and oos["Expectancy_R"] > GATES["oos_min_exp_r"])
+              g["G2_dd"] = oos["Max_Drawdown_pct"] <= GATES["oos_max_dd_pct"]
+              g["G3_wf"] = (wf["profitable"] / max(wf["n_windows"], 1) >= GATES["wf_min_profitable"]
+                            and wf["aggregate"]["Profit_Factor"] >= GATES["wf_min_cum_pf"]
+                            and wf["worst_window"] >= GATES["wf_worst_window_min"])
+              g["G4_sens"] = sens["profitable_neighbor_share"] >= GATES["sens_min_neighbor_profitable"]
+              mcj = mc.get("block", mc.get("iid", {}))
+              g["G5_mc"] = (mcj.get("p_maxdd_gt_30", 1.0) <= GATES["mc_p_maxdd30_max"]
+                            and mcj.get("p_return_lt_0", 1.0) <= GATES["mc_p_neg_max"])
+              g["G6_cost"] = stress.get("conservative_net", -1) > 0
+              syms = [m["Profit_Factor"] for m in per_sym.values() if m["Total_Trades"] > 0]
+              g["G7_symbols"] = (sum(1 for pf_ in syms if pf_ >= 1.0) >= GATES["g7_min_symbols_pf_ge1"]
+                                 and all(pf_ >= GATES["g7_min_symbol_pf"] for pf_ in syms)) \
+                                if syms else False
+              g["G8_paper"] = None
+              verdict = "NOT READY FOR REAL MONEY"
+              if all(v is True for k, v in g.items() if k != "G8_paper"):
+                  verdict = "READY FOR PAPER TRADING (G8 pending)"
+              return dict(gates=g, verdict=verdict)
+          EOF
+          cat > run_all.py <<'EOF'
+          """MG pipeline: data -> quality -> baseline(train/val) -> walk-forward ->
+          sensitivity -> OOS(+stress+MC+gates). Real outputs only; nothing invented."""
+          import argparse, json
+          from pathlib import Path
+          import pandas as pd
+          import data as datamod
+          from config import (SYMBOLS, BASE_PARAMS, COST_SCENARIOS, TRAIN, VALID, OOS,
+                              RISK_PCT, RISK_PCT_CONSERVATIVE)
+          from backtest import run_backtest
+          from metrics import compute, per_symbol, build_regimes, tag_trades, per_regime
+          from walkforward import run as wf_run
+          from sensitivity import run as sens_run
+          from monte_carlo import simulate
+          from reports import (ensure_dirs, save_trades, save_metrics,
+                               append_experiment_log, evaluate_gates)
+
+          def mrow(m):
+              return {k: (round(v, 4) if isinstance(v, float) else v) for k, v in m.items()}
+
+          def main():
+              ap = argparse.ArgumentParser()
+              ap.add_argument("--stage", default="all",
+                              choices=["data","baseline","wf","sens","oos","all"])
+              ap.add_argument("--symbols", default=",".join(SYMBOLS))
+              ap.add_argument("--risk", type=float, default=RISK_PCT)
+              a = ap.parse_args()
+              ensure_dirs()
+              syms = [s.strip().upper() for s in a.symbols.split(",")]
+
+              if a.stage in ("data", "all"):
+                  datamod.download_all(symbols=syms)
+
+              d15, d4 = datamod.load(symbols=syms)
+              base = dict(BASE_PARAMS)
+              cost = COST_SCENARIOS["realistic"]
+
+              if a.stage in ("baseline", "all"):
+                  regtab, _ = build_regimes(d4, d15)
+                  for scn in ("optimistic", "realistic", "conservative"):
+                      r = run_backtest(d15, d4, base, COST_SCENARIOS[scn], a.risk,
+                                       warm_from="2018-01-01", trading_from=TRAIN[0],
+                                       end=VALID[1] + " 23:59:59")
+                      m = compute(r["trades"], r["curve_t"], r["curve_v"])
+                      save_metrics(mrow(m), f"outputs/baseline/metrics_trainval_{scn}.json")
+                      print(f"[baseline/{scn}] trades={m['Total_Trades']} "
+                            f"ret={m['Net_Return_pct']:.2f}% pf={m['Profit_Factor']:.2f} "
+                            f"mdd={m['Max_Drawdown_pct']:.2f}%")
+                      if scn == "realistic":
+                          tag_trades(r["trades"], regtab)
+                          save_metrics({k: mrow(v) for k, v in per_symbol(r["trades"]).items()},
+                                       "outputs/baseline/metrics_by_symbol.json")
+                          save_metrics({k: mrow(v) for k, v in per_regime(r["trades"]).items()},
+                                       "outputs/baseline/metrics_by_regime.json")
+                          save_trades(r["trades"], "outputs/baseline/trade_log_trainval_realistic.csv")
+                          save_metrics({"audits": {s: a_[:5000] for s, a_ in r["audits"].items()}},
+                                       "outputs/baseline/state_audit_sample.json")
+                          rc = run_backtest(d15, d4, base, COST_SCENARIOS["conservative"],
+                                            RISK_PCT_CONSERVATIVE, warm_from="2018-01-01",
+                                            trading_from=TRAIN[0], end=VALID[1] + " 23:59:59")
+                          mc0 = compute(rc["trades"], rc["curve_t"], rc["curve_v"])
+                          save_metrics(mrow(mc0), "outputs/baseline/metrics_risk0.5pct_conservative.json")
+                  append_experiment_log(dict(
+                      Version="V1.0.1-IMPL (logic=V1.0-BASELINE)",
+                      Date=pd.Timestamp.utcnow().isoformat(),
+                      Changes="implementation fixes: 2018 burn-in year, minor code cleanups. NO strategy logic change",
+                      Reason="correctness before first run; logged transparently",
+                      Train_Result="outputs/baseline/*.json",
+                      Validation_Result="outputs/sensitivity/report.json",
+                      WF_Result="outputs/walkforward/summary.json",
+                      OOS_Result="pending", Decision="EVALUATED_AFTER_OOS"))
+
+              if a.stage in ("wf", "all"):
+                  wf = wf_run(d15, d4, base, cost)
+                  save_metrics({k: v for k, v in wf.items() if k != "windows"},
+                               "outputs/walkforward/summary.json")
+                  save_metrics(wf["windows"], "outputs/walkforward/windows.json")
+                  print(f"[wf] windows={wf['n_windows']} profitable={wf['profitable']} "
+                        f"aggPF={wf['aggregate']['Profit_Factor']:.2f}")
+
+              if a.stage in ("sens", "all"):
+                  sn = sens_run(d15, d4, base, cost)
+                  save_metrics(sn, "outputs/sensitivity/report.json")
+                  print(f"[sens] profitable neighbors={sn['profitable_neighbor_share']:.0%} "
+                        f"warning={sn['overfit_warning']}")
+
+              if a.stage in ("oos", "all"):
+                  fin = Path("outputs/finalist.json")
+                  params = dict(base)
+                  if fin.exists():
+                      params.update(json.loads(fin.read_text()))
+                      params["version"] += "|FINALIST"
+                  regtab, _ = build_regimes(d4, d15)
+                  stress, oos_trades, mc_src = {}, [], None
+                  for scn in ("optimistic", "realistic", "conservative"):
+                      for mult in ([1.0] if scn != "realistic" else
+                                   [1.0, 1.5, 2.0, 2.5, 3.0, 4.0, 5.0]):
+                          c = {k: v * mult for k, v in COST_SCENARIOS[scn].items()}
+                          r = run_backtest(d15, d4, params, c, a.risk,
+                                           warm_from="2023-10-01", trading_from=OOS[0])
+                          m = compute(r["trades"], r["curve_t"], r["curve_v"])
+                          key = scn if mult == 1.0 else f"{scn}x{mult}"
+                          stress[key] = mrow(m)
+                          print(f"[oos] {key}: trades={m['Total_Trades']} "
+                                f"ret={m['Net_Return_pct']:.2f}% pf={m['Profit_Factor']:.2f}")
+                          if scn == "realistic":
+                              oos_trades = r["trades"]
+                              if mult == 1.0: mc_src = [t["r_multiple"] for t in r["trades"]]
+                  ks = [1.0, 1.5, 2.0, 2.5, 3.0, 4.0, 5.0]
+                  nets = [stress[f"realisticx{k}"]["Net_Profit"] for k in ks]
+                  bk = "N/A (baseline negative)" if stress["realistic"]["Net_Profit"] <= 0 else ">5.0"
+                  for i in range(len(ks) - 1):
+                      if nets[i] > 0 >= nets[i + 1]:
+                          f = nets[i] / (nets[i] - nets[i + 1])
+                          bk = round(ks[i] + f * (ks[i + 1] - ks[i]), 2); break
+                  mc = simulate(mc_src, a.risk)
+                  tag_trades(oos_trades, regtab)
+                  psym = per_symbol(oos_trades)
+                  save_trades(oos_trades, "outputs/oos/trade_log_oos.csv")
+                  save_metrics(stress, "outputs/oos/cost_stress.json")
+                  save_metrics(mc, "outputs/oos/monte_carlo.json")
+                  save_metrics({k: mrow(v) for k, v in psym.items()},
+                               "outputs/oos/metrics_by_symbol.json")
+                  save_metrics({k: mrow(v) for k, v in per_regime(oos_trades).items()},
+                               "outputs/oos/metrics_by_regime.json")
+                  wf_sum = Path("outputs/walkforward/summary.json")
+                  sens_rep = Path("outputs/sensitivity/report.json")
+                  gates = evaluate_gates(
+                      stress["realistic"],
+                      json.loads(wf_sum.read_text()) if wf_sum.exists() else dict(
+                          n_windows=1, profitable=0, aggregate={"Profit_Factor": 0}, worst_window=-100),
+                      json.loads(sens_rep.read_text()) if sens_rep.exists() else dict(
+                          profitable_neighbor_share=0),
+                      mc, psym, dict(conservative_net=stress["conservative"]["Net_Profit"]))
+                  gates["breakeven_cost_multiple"] = bk
+                  save_metrics(gates, "outputs/oos/gates.json")
+                  append_experiment_log(dict(
+                      Version=params["version"], Date=pd.Timestamp.utcnow().isoformat(),
+                      Changes=json.loads(fin.read_text()) if fin.exists() else "baseline as finalist",
+                      Reason="finalist OOS evaluation (single pass)",
+                      Train_Result="outputs/baseline", Validation_Result="outputs/sensitivity",
+                      WF_Result="outputs/walkforward", OOS_Result="outputs/oos",
+                      Decision=gates["verdict"]))
+                  print("\n================ FINAL VERDICT ================")
+                  print(gates["verdict"])
+                  print(f"Breakeven cost multiple: {bk}")
+                  print("Gates:", json.dumps(gates["gates"], indent=2))
+
+          if __name__ == "__main__":
+              main()
+          EOF
+          cat > tests/test_causality.py <<'EOF'
+          """Anti-lookahead test: poisoning FUTURE data must not change PAST trades."""
+          import sys, pathlib
+          sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
+          import pandas as pd
+          import data as datamod
+          from config import BASE_PARAMS, COST_SCENARIOS
+          from backtest import run_backtest
+
+          def main():
+              d15, d4 = datamod.load(symbols=["BTCUSDT"])
+              cut = "2021-06-30"
+              r1 = run_backtest(d15, d4, BASE_PARAMS, COST_SCENARIOS["realistic"], end=cut)
+              d15b = {s: df.copy() for s, df in d15.items()}
+              d4b = {s: df.copy() for s, df in d4.items()}
+              for df in list(d15b.values()) + list(d4b.values()):
+                  m = df.index > pd.Timestamp(cut)
+                  df.loc[m, ["open", "high", "low", "close"]] = 999_999.0
+              r2 = run_backtest(d15b, d4b, BASE_PARAMS, COST_SCENARIOS["realistic"], end=cut)
+              t1 = [(t["setup_id"], t["entry_ns"], t["exit_ns"], round(t["pnl"], 10))
+                    for t in r1["trades"]]
+              t2 = [(t["setup_id"], t["entry_ns"], t["exit_ns"], round(t["pnl"], 10))
+                    for t in r2["trades"]]
+              assert t1 == t2, "LOOKAHEAD DETECTED: past trades changed by future data"
+              print(f"CAUSALITY OK - {len(t1)} trades identical with poisoned future data")
+
+          if __name__ == "__main__":
+              main()
+          EOF
+          echo "source files written:"; ls -la
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Download real data + quality audit
+        run: python run_all.py --stage data
+
+      - name: Causality test (anti-lookahead, mandatory)
+        run: python tests/test_causality.py
+
+      - name: Baseline backtest (Train+Val, 3 cost scenarios)
+        run: python run_all.py --stage baseline
+
+      - name: Walk-Forward
+        run: python run_all.py --stage wf
+
+      - name: Sensitivity
+        run: python run_all.py --stage sens
+
+      - name: OOS + Cost Stress + Monte Carlo + Gates
+        run: python run_all.py --stage oos
+
+      - name: Show final verdict
+        run: |
+          echo "================ FINAL VERDICT ================"
+          cat outputs/oos/gates.json || echo "gates.json missing - check earlier steps"
+          echo "================ EXPERIMENT LOG ================"
+          cat outputs/logs/experiment_log.csv || true
+
+      - name: Upload real reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mg-reports
+          path: outputs/
+
+  android:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    needs: pipeline
+    if: always()
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Write Android project (self-contained)
+        run: |
+          mkdir -p android/app/src/main/java/com/mg/app
+          mkdir -p android/app/src/main/res/values
+          mkdir -p android/app/src/main/res/mipmap-anydpi-v26
+          mkdir -p android-art
+          cat > android/settings.gradle <<'EOF'
+          pluginManagement {
+              repositories { google(); mavenCentral(); gradlePluginPortal() }
+          }
+          dependencyResolutionManagement {
+              repositories { google(); mavenCentral() }
+          }
+          rootProject.name = "MG"
+          include(":app")
+          EOF
+          cat > android/build.gradle <<'EOF'
+          plugins {
+              id "com.android.application" version "8.4.1" apply false
+              id "org.jetbrains.kotlin.android" version "1.9.23" apply false
+          }
+          EOF
+          cat > android/gradle.properties <<'EOF'
+          org.gradle.jvmargs=-Xmx3g
+          android.useAndroidX=true
+          kotlin.code.style=official
+          EOF
+          cat > android/app/build.gradle <<'EOF'
+          plugins {
+              id "com.android.application"
+              id "org.jetbrains.kotlin.android"
+          }
+          android {
+              namespace "com.mg.app"
+              compileSdk 34
+              defaultConfig {
+                  applicationId "com.mg.app"
+                  minSdk 26
+                  targetSdk 34
+                  versionCode 1
+                  versionName "1.0"
+              }
+              signingConfigs {
+                  release {
+                      storeFile file("mg.jks")
+                      storePassword System.getenv("MG_STORE_PASS") ?: "mgdemo_store_2024"
+                      keyAlias "mg"
+                      keyPassword System.getenv("MG_KEY_PASS") ?: "mgdemo_store_2024"
+                  }
+              }
+              buildTypes {
+                  release {
+                      minifyEnabled false
+                      signingConfig signingConfigs.release
+                  }
+              }
+              compileOptions {
+                  sourceCompatibility JavaVersion.VERSION_17
+                  targetCompatibility JavaVersion.VERSION_17
+              }
+              kotlinOptions { jvmTarget = "17" }
+              buildFeatures { compose true }
+              composeOptions { kotlinCompilerExtensionVersion "1.5.11" }
+          }
+          dependencies {
+              implementation platform("androidx.compose:compose-bom:2024.05.00")
+              implementation "androidx.activity:activity-compose:1.9.0"
+              implementation "androidx.compose.material3:material3"
+              implementation "androidx.compose.ui:ui"
+          }
+          EOF
+          cat > android/app/src/main/AndroidManifest.xml <<'EOF'
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <application
+                  android:label="MG"
+                  android:icon="@mipmap/ic_launcher">
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true"
+                      android:theme="@android:style/Theme.Material.Light.NoActionBar">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+              </application>
+          </manifest>
+          EOF
+          cat > android/app/src/main/java/com/mg/app/MainActivity.kt <<'EOF'
+          package com.mg.app
+
+          import android.os.Bundle
+          import androidx.activity.ComponentActivity
+          import androidx.activity.compose.setContent
+          import androidx.compose.foundation.layout.*
+          import androidx.compose.foundation.lazy.LazyColumn
+          import androidx.compose.material3.*
+          import androidx.compose.runtime.*
+          import androidx.compose.ui.Modifier
+          import androidx.compose.ui.platform.LocalContext
+          import androidx.compose.ui.unit.dp
+          import androidx.compose.ui.unit.sp
+          import org.json.JSONObject
+
+          class MainActivity : ComponentActivity() {
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  setContent { MgScreen() }
+              }
+          }
+
+          @OptIn(ExperimentalMaterial3Api::class)
+          @Composable
+          fun MgScreen() {
+              val ctx = LocalContext.current
+              var verdict by remember { mutableStateOf("PENDING") }
+              var metricsRaw by remember { mutableStateOf("not available") }
+              LaunchedEffect(Unit) {
+                  runCatching {
+                      ctx.assets.open("gates.json").bufferedReader().use { it.readText() }
+                  }.onSuccess { verdict = JSONObject(it).optString("verdict", "PENDING") }
+                  runCatching {
+                      ctx.assets.open("metrics_trainval_realistic.json")
+                          .bufferedReader().use { it.readText() }
+                  }.onSuccess { metricsRaw = it }
+              }
+              var tab by remember { mutableStateOf(0) }
+              val tabs = listOf("Dashboard","Signals","Positions","History","Performance","Settings")
+              Scaffold(topBar = { TopAppBar(title = { Text("MG") }) }) { pad ->
+                  Column(Modifier.padding(pad)) {
+                      TabRow(selectedTabIndex = tab) {
+                          tabs.forEachIndexed { i, t ->
+                              Tab(text = { Text(t, fontSize = 10.sp) },
+                                  selected = tab == i, onClick = { tab = i })
+                          }
+                      }
+                      when (tab) {
+                          0 -> Info("FINAL VERDICT (from real gates.json)",
+                              verdict + "\n\nThis value comes from the real backtest run. " +
+                              "Until all gates pass, the system is NOT ready for real money.")
+                          1 -> Info("Signals",
+                              "Paper-trading engine: PENDING cross-validation " +
+                              "(Python-Kotlin 100% match harness). No signals are generated yet.")
+                          2 -> Info("Positions",
+                              "No open positions. Portfolio module activates only after engine validation.")
+                          3 -> Info("Trade History",
+                              "Will be populated by the real engine only. Nothing is simulated here.")
+                          4 -> Info("Train+Val Metrics (realistic costs, real run)", metricsRaw)
+                          else -> Info("Settings",
+                              "API keys are NEVER hardcoded. They will be entered by the user and " +
+                              "stored in EncryptedSharedPreferences (Android Keystore). " +
+                              "Paper trading will use the same strategy core as the validated backtest.")
+                      }
+                  }
+              }
+          }
+
+          @Composable
+          fun Info(title: String, body: String) {
+              LazyColumn(Modifier.fillMaxSize().padding(16.dp),
+                         verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                  item { Text(title, style = MaterialTheme.typography.titleMedium) }
+                  item { Text(body, fontSize = 13.sp) }
+              }
+          }
+          EOF
+          cat > android/app/src/main/res/values/colors.xml <<'EOF'
+          <resources>
+              <color name="ic_launcher_background">#0B1220</color>
+          </resources>
+          EOF
+          cat > android/app/src/main/res/mipmap-anydpi-v26/ic_launcher.xml <<'EOF'
+          <adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android">
+              <background android:drawable="@color/ic_launcher_background" />
+              <foreground android:drawable="@mipmap/ic_launcher_foreground" />
+          </adaptive-icon>
+          EOF
+          cat > android/icons_gen.py <<'EOF'
+          """Generate launcher icons. If android-art/logo.png exists (user's own image),
+          the original subject is preserved and fitted into the adaptive-icon safe zone.
+          Otherwise a neutral MG placeholder is used. No fake logo is ever invented."""
+          import os
+          from PIL import Image, ImageDraw, ImageFont
+
+          SIZES = {"mdpi": 48, "hdpi": 72, "xhdpi": 96, "xxhdpi": 144, "xxxhdpi": 192}
+          BG = (11, 18, 32, 255)
+          src = "android-art/logo.png"
+          logo = Image.open(src).convert("RGBA") if os.path.exists(src) else None
+          print("logo found" if logo else "logo NOT found - using neutral placeholder")
+
+          def fg(px):
+              img = Image.new("RGBA", (px, px), (0, 0, 0, 0))
+              if logo:
+                  s = int(px * 0.72)
+                  r = logo.copy(); r.thumbnail((s, s), Image.LANCZOS)
+                  img.paste(r, ((px - r.width) // 2, (px - r.height) // 2), r)
+              else:
+                  d = ImageDraw.Draw(img)
+                  try:
+                      f = ImageFont.load_default(int(px * 0.42))
+                  except TypeError:
+                      f = ImageFont.load_default()
+                  d.text((px / 2, px / 2), "MG", font=f, fill=(240, 244, 255, 255), anchor="mm")
+              return img
+
+          for q, px in SIZES.items():
+              d = os.path.join("android", "app", "src", "main", "res", f"mipmap-{q}")
+              os.makedirs(d, exist_ok=True)
+              icon = fg(px)
+              icon.save(os.path.join(d, "ic_launcher_foreground.png"))
+              base = Image.new("RGBA", (px, px), BG)
+              base.alpha_composite(icon)
+              base.save(os.path.join(d, "ic_launcher.png"))
+          print("icons generated")
+          EOF
+          echo "android project written"
+
+      - name: Generate icons
+        run: |
+          pip install pillow
+          python android/icons_gen.py
+
+      - name: Download pipeline reports (for in-app verdict)
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          name: mg-reports
+          path: reports
+
+      - name: Embed real verdict into app assets
+        run: |
+          mkdir -p android/app/src/main/assets
+          GATES=$(find reports -name gates.json 2>/dev/null | head -1)
+          MET=$(find reports -name metrics_trainval_realistic.json 2>/dev/null | head -1)
+          if [ -n "$GATES" ]; then cp "$GATES" android/app/src/main/assets/gates.json; fi
+          if [ -n "$MET" ]; then cp "$MET" android/app/src/main/assets/metrics_trainval_realistic.json; fi
+          [ -f android/app/src/main/assets/gates.json ] || \
+            echo '{"verdict": "PENDING - pipeline results not found in this run"}' > android/app/src/main/assets/gates.json
+          [ -f android/app/src/main/assets/metrics_trainval_realistic.json ] || \
+            echo '{}' > android/app/src/main/assets/metrics_trainval_realistic.json
+          echo "--- embedded gates.json ---"
+          cat android/app/src/main/assets/gates.json
+
+      - name: Create signing keystore (demo key; replace with your own via Secrets for production)
+        run: |
+          keytool -genkeypair -v -keystore android/app/mg.jks -storetype JKS \
+            -alias mg -keyalg RSA -keysize 2048 -validity 10000 \
+            -storepass mgdemo_store_2024 -keypass mgdemo_store_2024 \
+            -dname "CN=MG, OU=MG, O=MG, L=Internet, C=US"
+
+      - name: Build release APK
+        run: gradle -p android assembleRelease --no-daemon
+
+      - name: Rename to MG.apk
+        run: |
+          cp android/app/build/outputs/apk/release/app-release.apk MG.apk
+          ls -lh MG.apk
+
+      - name: Upload MG.apk
+        uses: actions/upload-artifact@v4
+        with:
+          name: MG-apk
+          path: MG.apk
