@@ -519,7 +519,8 @@ jobs:
                           self._expire(idx)
                       return None
                   return None
-          EOF          cat > portfolio.py <<'EOF'
+          EOF
+          cat > portfolio.py <<'EOF'
           """Risk-based portfolio: sizing, fees, slippage, equity marking, Trade Log."""
           import pandas as pd
           from config import INITIAL_EQUITY, MAX_NOTIONAL_FRAC
