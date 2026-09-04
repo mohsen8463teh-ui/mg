@@ -1177,7 +1177,8 @@ jobs:
               if all(v is True for k, v in g.items() if k != "G8_paper"):
                   verdict = "READY FOR PAPER TRADING (G8 pending)"
               return dict(gates=g, verdict=verdict)
-          EOF 
+              
+          EOF
           cat > run_all.py <<'EOF'
           """MG pipeline: data -> quality -> baseline(train/val) -> walk-forward ->
           sensitivity -> OOS(+stress+MC+gates). Real outputs only; nothing invented."""
