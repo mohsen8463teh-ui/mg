@@ -1128,6 +1128,56 @@ jobs:
                   verdict = "READY FOR PAPER TRADING (G8 pending)"
               return dict(gates=g, verdict=verdict)
           EOF
+          cat > reports.py <<'EOF'
+          """All reports, Trade Log CSV, Experiment Log CSV, Gate evaluation."""
+          import json, csv
+          from pathlib import Path
+          import pandas as pd
+          from config import GATES
+
+          def ensure_dirs():
+              for d in ["outputs/baseline","outputs/walkforward","outputs/sensitivity",
+                        "outputs/oos","outputs/logs"]:
+                  Path(d).mkdir(parents=True, exist_ok=True)
+
+          def save_trades(trades, path):
+              pd.DataFrame(trades if trades else [{"note": "no trades"}]).to_csv(path, index=False)
+
+          def save_metrics(d, path):
+              Path(path).write_text(json.dumps(d, indent=2, default=str))
+
+          def append_experiment_log(entry, path="outputs/logs/experiment_log.csv"):
+              p = Path(path); exists = p.exists()
+              cols = ["Version","Date","Changes","Reason","Train_Result","Validation_Result",
+                      "WF_Result","OOS_Result","Decision"]
+              row = {c: entry.get(c, "") for c in cols}
+              with open(p, "a", newline="") as f:
+                  w = csv.DictWriter(f, fieldnames=cols)
+                  if not exists: w.writeheader()
+                  w.writerow(row)
+
+          def evaluate_gates(oos, wf, sens, mc, per_sym, stress):
+              g = {}
+              g["G1_oos"] = (oos["Net_Return_pct"] > 0 and oos["Profit_Factor"] >= GATES["oos_min_pf"]
+                             and oos["Expectancy_R"] > GATES["oos_min_exp_r"])
+              g["G2_dd"] = oos["Max_Drawdown_pct"] <= GATES["oos_max_dd_pct"]
+              g["G3_wf"] = (wf["profitable"] / max(wf["n_windows"], 1) >= GATES["wf_min_profitable"]
+                            and wf["aggregate"]["Profit_Factor"] >= GATES["wf_min_cum_pf"]
+                            and wf["worst_window"] >= GATES["wf_worst_window_min"])
+              g["G4_sens"] = sens["profitable_neighbor_share"] >= GATES["sens_min_neighbor_profitable"]
+              mcj = mc.get("block", mc.get("iid", {}))
+              g["G5_mc"] = (mcj.get("p_maxdd_gt_30", 1.0) <= GATES["mc_p_maxdd30_max"]
+                            and mcj.get("p_return_lt_0", 1.0) <= GATES["mc_p_neg_max"])
+              g["G6_cost"] = stress.get("conservative_net", -1) > 0
+              syms = [m["Profit_Factor"] for m in per_sym.values() if m["Total_Trades"] > 0]
+              g["G7_symbols"] = (sum(1 for pf in syms if pf >= 1.0) >= GATES["g7_min_symbols_pf_ge1"]
+                                 and all(pf >= GATES["g7_min_symbol_pf"] for pf in syms)) if syms else False
+              g["G8_paper"] = None
+              verdict = "NOT READY FOR REAL MONEY"
+              if all(v is True for k, v in g.items() if k != "G8_paper"):
+                  verdict = "READY FOR PAPER TRADING (G8 pending)"
+              return dict(gates=g, verdict=verdict)
+          EOF 
           cat > run_all.py <<'EOF'
           """MG pipeline: data -> quality -> baseline(train/val) -> walk-forward ->
           sensitivity -> OOS(+stress+MC+gates). Real outputs only; nothing invented."""
