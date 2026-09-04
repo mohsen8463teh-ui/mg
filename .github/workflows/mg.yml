@@ -295,7 +295,7 @@ jobs:
 
               def _add_pool(self, idx, level, source):
                   tol = max(self.p["eq_tol_pct"] * level, self.p["eq_tol_atr"] * self.atr[idx])
-                  for _, q in self.slevels:
+                  for _, _, q in self.slevels:
                       if q.active and abs(q.level - level) <= tol:
                           return
                   self._register(Pool(level, source))
@@ -800,7 +800,7 @@ jobs:
               out, k = [], 0
               while True:
                   y0, m0 = _months(2019, 1, k);            y1, m1 = _months(2019, 1, k + 18)
-                  y2, m2 = _months(2019, 1, k + 18)
+                  y2, m2 = _months(2019, 1, k + 21)
                   ts = f"{y1}-{m1:02d}-01"; te = f"{y2}-{m2:02d}-01"
                   if y2 > 2023 or (y2 == 2023 and m2 > 12):
                       te = "2024-01-01"
