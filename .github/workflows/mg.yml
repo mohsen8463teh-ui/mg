@@ -940,7 +940,7 @@ jobs:
               return out
           EOF
           cat > portfolio.py <<'EOF'
-                    """Risk-based portfolio: sizing, fees, slippage, equity marking, Trade Log."""
+          """Risk-based portfolio: sizing, fees, slippage, equity marking, Trade Log."""
           import pandas as pd
           from config import INITIAL_EQUITY, MAX_NOTIONAL_FRAC
 
