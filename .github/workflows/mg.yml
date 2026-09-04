@@ -1,4 +1,4 @@
-آهname: MG-Full-Pipeline
+name: MG-Full-Pipeline
 
 on:
   push:
