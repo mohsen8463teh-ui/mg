@@ -185,8 +185,10 @@ jobs:
               symbols = symbols or SYMBOLS
               d15, d4 = {}, {}
               for s in symbols:
-                  a = pd.read_csv(Path(raw_dir)/f"{s}_15m.csv", index_col=0, parse_dates=True)
-                  b = pd.read_csv(Path(raw_dir)/f"{s}_4h.csv",  index_col=0, parse_dates=True)
+                  a = pd.read_csv(Path(raw_dir)/f"{s}_15m.csv", index_col=0)
+                  b = pd.read_csv(Path(raw_dir)/f"{s}_4h.csv",  index_col=0)
+                  a.index = pd.to_datetime(a.index)
+                  b.index = pd.to_datetime(b.index)
                   d15[s], d4[s] = a, b
               return d15, d4
           EOF
