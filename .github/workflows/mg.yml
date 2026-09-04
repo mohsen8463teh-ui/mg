@@ -938,7 +938,8 @@ jobs:
               blk = r[idx.reshape(n_paths, -1)[:, :N]]
               out["block"] = stats(blk)
               return out
-          EOF          cat > reports.py <<'EOF'
+          EOF
+          cat > portfolio.py <<'EOF'
           """All reports, Trade Log CSV, Experiment Log CSV, Gate evaluation."""
           import json, csv
           from pathlib import Path
