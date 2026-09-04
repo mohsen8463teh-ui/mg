@@ -959,6 +959,7 @@ jobs:
                   verdict = "READY FOR PAPER TRADING (G8 pending)"
               return dict(gates=g, verdict=verdict)
           EOF
+          cat > monte_carlo.py <<'EOF'
           """Monte Carlo on REAL OOS trades only. IID + block bootstrap (block=5)."""
           import numpy as np
 
