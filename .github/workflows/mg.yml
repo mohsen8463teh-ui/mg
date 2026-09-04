@@ -940,6 +940,86 @@ jobs:
               return out
           EOF
           cat > portfolio.py <<'EOF'
+                    """Risk-based portfolio: sizing, fees, slippage, equity marking, Trade Log."""
+          import pandas as pd
+          from config import INITIAL_EQUITY, MAX_NOTIONAL_FRAC
+
+          class Portfolio:
+              def __init__(self, cost, risk_pct, version):
+                  self.cost = cost; self.risk_pct = risk_pct; self.version = version
+                  self.cash = INITIAL_EQUITY
+                  self.positions = {}
+                  self.trades = []
+                  self.fees_total = 0.0; self.slip_total = 0.0
+                  self._ids = 0
+
+              def open_from_engine(self, symbol, ts_ns, raw_open, engine, params):
+                  c = self.cost
+                  entry = raw_open * (1 + c["slip"])
+                  sl = engine.pending["sl"]
+                  risk_amt0 = self.equity() * self.risk_pct
+                  size = risk_amt0 / max(entry - sl, 1e-12)
+                  max_not = MAX_NOTIONAL_FRAC * self.equity()
+                  if size * entry > max_not:
+                      size = max_not / entry
+                  risk_amt = size * (entry - sl)
+                  fee_in = size * entry * c["fee"]
+                  self.cash -= size * entry + fee_in
+                  self.fees_total += fee_in
+                  self.slip_total += size * raw_open * c["slip"]
+                  tp = entry + params["tp_r"] * (entry - sl)
+                  self._ids += 1
+                  meta = engine.pending
+                  pos = dict(setup_id=f"{symbol}-{meta['sig_idx']}-{self._ids}",
+                             symbol=symbol, entry_ns=ts_ns, entry_fill=entry, sl=sl, tp=tp,
+                             size=size, risk_pct=self.risk_pct, risk_amount=risk_amt,
+                             fee_in=fee_in, pl15=meta["pl_price"], meta=meta)
+                  self.positions[symbol] = pos
+                  engine.confirm_entry()
+                  return pos
+
+              def equity(self):
+                  return self.cash + sum(p["size"] * p.get("mark", p["entry_fill"])
+                                         for p in self.positions.values())
+
+              def mark(self, marks):
+                  for s, p in self.positions.items():
+                      p["mark"] = marks.get(s, p.get("mark", p["entry_fill"]))
+                  return self.cash + sum(p["size"] * p["mark"] for p in self.positions.values())
+
+              def close(self, symbol, ts_ns, raw_fill, reason, stop, engine, params):
+                  p = self.positions.pop(symbol)
+                  c = self.cost
+                  fill = raw_fill * (1 - c["slip"])
+                  if stop: fill *= (1 - c["stop_slip"])
+                  fee_out = p["size"] * fill * c["fee"]
+                  slip_cost = p["size"] * raw_fill * c["slip"] + \
+                              (p["size"] * raw_fill * c["stop_slip"] if stop else 0.0)
+                  self.cash += p["size"] * fill - fee_out
+                  self.fees_total += fee_out; self.slip_total += slip_cost
+                  pnl = p["size"] * (fill - p["entry_fill"]) - p["fee_in"] - fee_out
+                  r = pnl / p["risk_amount"] if p["risk_amount"] > 0 else 0.0
+                  m = p["meta"]; ck = m["checklist"]
+                  self.trades.append(dict(
+                      setup_id=p["setup_id"], symbol=symbol,
+                      timestamp_entry=str(pd.Timestamp(p["entry_ns"])),
+                      entry_ns=p["entry_ns"], exit_ns=ts_ns,
+                      trend_pass=ck["trend"], struct_pass=ck["struct"], pivot_pass=ck["pivot"],
+                      bos_pass=ck["bos"], pullback_pass=ck["pullback"], sweep_pass=ck["sweep"],
+                      confirm_pass=ck["confirm"],
+                      zone_up=m["zone_up"], zone_low=m["zone_low"], touch_ts=m["touch_ts"],
+                      level_L=m["level"], pen_depth=m["pen"], liq_source=m["source"],
+                      sweep_ts=m["sweep_ts"], closeback_ts=m["sweep_ts"],
+                      confirm_ts=m["sig_ts"], entry_ts=p["entry_ns"],
+                      entry_price=p["entry_fill"], sl_price=p["sl"],
+                      dist_to_sl=p["entry_fill"] - p["sl"], tp_price=p["tp"],
+                      risk_pct=p["risk_pct"], risk_amount=p["risk_amount"],
+                      position_size=p["size"],
+                      exit_ts=ts_ns, exit_price=fill, exit_reason=reason,
+                      fees=p["fee_in"] + fee_out, slippage=slip_cost,
+                      pnl=pnl, pnl_pct=100 * pnl / (p["size"] * p["entry_fill"]),
+                      r_multiple=r))
+                  engine.on_position_closed(ts_ns + 900_000_000)
           """All reports, Trade Log CSV, Experiment Log CSV, Gate evaluation."""
           import json, csv
           from pathlib import Path
