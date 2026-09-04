@@ -937,4 +937,274 @@ jobs:
               blk = r[idx.reshape(n_paths, -1)[:, :N]]
               out["block"] = stats(blk)
               return out
+          EOF          cat > reports.py <<'EOF'
+          """All reports, Trade Log CSV, Experiment Log CSV, Gate evaluation."""
+          import json, csv
+          from pathlib import Path
+          import pandas as pd
+          from config import GATES
+
+          def ensure_dirs():
+              for d in ["outputs/baseline","outputs/walkforward","outputs/sensitivity",
+                        "outputs/oos","outputs/logs"]:
+                  Path(d).mkdir(parents=True, exist_ok=True)
+
+          def save_trades(trades, path):
+              if trades:
+                  pd.DataFrame(trades).to_csv(path, index=False)
+              else:
+                  pd.DataFrame([{"note": "no trades"}]).to_csv(path, index=False)
+
+          def save_metrics(d, path):
+              Path(path).write_text(json.dumps(d, indent=2, default=str))
+
+          def append_experiment_log(entry, path="outputs/logs/experiment_log.csv"):
+              p = Path(path); exists = p.exists()
+              cols = ["Version","Date","Changes","Reason","Train_Result","Validation_Result",
+                      "WF_Result","OOS_Result","Decision"]
+              row = {c: entry.get(c, "") for c in cols}
+              with open(p, "a", newline="") as f:
+                  w = csv.DictWriter(f, fieldnames=cols)
+                  if not exists: w.writeheader()
+                  w.writerow(row)
+
+          def evaluate_gates(oos, wf, sens, mc, per_sym, stress):
+              g = {}
+              g["G1_oos"] = (oos["Net_Return_pct"] > 0 and oos["Profit_Factor"] >= GATES["oos_min_pf"]
+                             and oos["Expectancy_R"] > GATES["oos_min_exp_r"])
+              g["G2_dd"] = oos["Max_Drawdown_pct"] <= GATES["oos_max_dd_pct"]
+              g["G3_wf"] = (wf["profitable"] / max(wf["n_windows"], 1) >= GATES["wf_min_profitable"]
+                            and wf["aggregate"]["Profit_Factor"] >= GATES["wf_min_cum_pf"]
+                            and wf["worst_window"] >= GATES["wf_worst_window_min"])
+              g["G4_sens"] = sens["profitable_neighbor_share"] >= GATES["sens_min_neighbor_profitable"]
+              mcj = mc.get("block", mc.get("iid", {}))
+              g["G5_mc"] = (mcj.get("p_maxdd_gt_30", 1.0) <= GATES["mc_p_maxdd30_max"]
+                            and mcj.get("p_return_lt_0", 1.0) <= GATES["mc_p_neg_max"])
+              g["G6_cost"] = stress.get("conservative_net", -1) > 0
+              syms = [m["Profit_Factor"] for m in per_sym.values() if m["Total_Trades"] > 0]
+              g["G7_symbols"] = (sum(1 for pf_ in syms if pf_ >= 1.0) >= GATES["g7_min_symbols_pf_ge1"]
+                                 and all(pf_ >= GATES["g7_min_symbol_pf"] for pf_ in syms)) \
+                                if syms else False
+              g["G8_paper"] = None
+              verdict = "NOT READY FOR REAL MONEY"
+              if all(v is True for k, v in g.items() if k != "G8_paper"):
+                  verdict = "READY FOR PAPER TRADING (G8 pending)"
+              return dict(gates=g, verdict=verdict)
           EOF
+          cat > run_all.py <<'EOF'
+          """MG pipeline: data -> quality -> baseline(train/val) -> walk-forward ->
+          sensitivity -> OOS(+stress+MC+gates). Real outputs only; nothing invented."""
+          import argparse, json
+          from pathlib import Path
+          import pandas as pd
+          import data as datamod
+          from config import (SYMBOLS, BASE_PARAMS, COST_SCENARIOS, TRAIN, VALID, OOS,
+                              RISK_PCT, RISK_PCT_CONSERVATIVE)
+          from backtest import run_backtest
+          from metrics import compute, per_symbol, build_regimes, tag_trades, per_regime
+          from walkforward import run as wf_run
+          from sensitivity import run as sens_run
+          from monte_carlo import simulate
+          from reports import (ensure_dirs, save_trades, save_metrics,
+                               append_experiment_log, evaluate_gates)
+
+          def mrow(m):
+              return {k: (round(v, 4) if isinstance(v, float) else v) for k, v in m.items()}
+
+          def main():
+              ap = argparse.ArgumentParser()
+              ap.add_argument("--stage", default="all",
+                              choices=["data","baseline","wf","sens","oos","all"])
+              ap.add_argument("--symbols", default=",".join(SYMBOLS))
+              ap.add_argument("--risk", type=float, default=RISK_PCT)
+              a = ap.parse_args()
+              ensure_dirs()
+              syms = [s.strip().upper() for s in a.symbols.split(",")]
+
+              if a.stage in ("data", "all"):
+                  datamod.download_all(symbols=syms)
+
+              d15, d4 = datamod.load(symbols=syms)
+              base = dict(BASE_PARAMS)
+              cost = COST_SCENARIOS["realistic"]
+
+              if a.stage in ("baseline", "all"):
+                  regtab, _ = build_regimes(d4, d15)
+                  for scn in ("optimistic", "realistic", "conservative"):
+                      r = run_backtest(d15, d4, base, COST_SCENARIOS[scn], a.risk,
+                                       warm_from="2018-01-01", trading_from=TRAIN[0],
+                                       end=VALID[1] + " 23:59:59")
+                      m = compute(r["trades"], r["curve_t"], r["curve_v"])
+                      save_metrics(mrow(m), f"outputs/baseline/metrics_trainval_{scn}.json")
+                      print(f"[baseline/{scn}] trades={m['Total_Trades']} "
+                            f"ret={m['Net_Return_pct']:.2f}% pf={m['Profit_Factor']:.2f} "
+                            f"mdd={m['Max_Drawdown_pct']:.2f}%")
+                      if scn == "realistic":
+                          tag_trades(r["trades"], regtab)
+                          save_metrics({k: mrow(v) for k, v in per_symbol(r["trades"]).items()},
+                                       "outputs/baseline/metrics_by_symbol.json")
+                          save_metrics({k: mrow(v) for k, v in per_regime(r["trades"]).items()},
+                                       "outputs/baseline/metrics_by_regime.json")
+                          save_trades(r["trades"], "outputs/baseline/trade_log_trainval_realistic.csv")
+                          save_metrics({"audits": {s: a_[:5000] for s, a_ in r["audits"].items()}},
+                                       "outputs/baseline/state_audit_sample.json")
+                          rc = run_backtest(d15, d4, base, COST_SCENARIOS["conservative"],
+                                            RISK_PCT_CONSERVATIVE, warm_from="2018-01-01",
+                                            trading_from=TRAIN[0], end=VALID[1] + " 23:59:59")
+                          mc0 = compute(rc["trades"], rc["curve_t"], rc["curve_v"])
+                          save_metrics(mrow(mc0), "outputs/baseline/metrics_risk0.5pct_conservative.json")
+                  append_experiment_log(dict(
+                      Version="V1.0.3-IMPL (logic=V1.0-BASELINE)",
+                      Date=pd.Timestamp.utcnow().isoformat(),
+                      Changes="impl fixes only: (a) int64-ns time comparisons in backtest loop, (b) exact 4H index via searchsorted. NO strategy logic change",
+                      Reason="correctness fixes after first execution attempt; logged transparently",
+                      Train_Result="outputs/baseline/*.json",
+                      Validation_Result="outputs/sensitivity/report.json",
+                      WF_Result="outputs/walkforward/summary.json",
+                      OOS_Result="pending", Decision="EVALUATED_AFTER_OOS"))
+
+              if a.stage in ("wf", "all"):
+                  wf = wf_run(d15, d4, base, cost)
+                  save_metrics({k: v for k, v in wf.items() if k != "windows"},
+                               "outputs/walkforward/summary.json")
+                  save_metrics(wf["windows"], "outputs/walkforward/windows.json")
+                  print(f"[wf] windows={wf['n_windows']} profitable={wf['profitable']} "
+                        f"aggPF={wf['aggregate']['Profit_Factor']:.2f}")
+
+              if a.stage in ("sens", "all"):
+                  sn = sens_run(d15, d4, base, cost)
+                  save_metrics(sn, "outputs/sensitivity/report.json")
+                  print(f"[sens] profitable neighbors={sn['profitable_neighbor_share']:.0%} "
+                        f"warning={sn['overfit_warning']}")
+
+              if a.stage in ("oos", "all"):
+                  fin = Path("outputs/finalist.json")
+                  params = dict(base)
+                  if fin.exists():
+                      params.update(json.loads(fin.read_text()))
+                      params["version"] += "|FINALIST"
+                  regtab, _ = build_regimes(d4, d15)
+                  stress, oos_trades, mc_src = {}, [], None
+                  for scn in ("optimistic", "realistic", "conservative"):
+                      for mult in ([1.0] if scn != "realistic" else
+                                   [1.0, 1.5, 2.0, 2.5, 3.0, 4.0, 5.0]):
+                          c = {k: v * mult for k, v in COST_SCENARIOS[scn].items()}
+                          r = run_backtest(d15, d4, params, c, a.risk,
+                                           warm_from="2023-10-01", trading_from=OOS[0])
+                          m = compute(r["trades"], r["curve_t"], r["curve_v"])
+                          key = scn if mult == 1.0 else f"{scn}x{mult}"
+                          stress[key] = mrow(m)
+                          print(f"[oos] {key}: trades={m['Total_Trades']} "
+                                f"ret={m['Net_Return_pct']:.2f}% pf={m['Profit_Factor']:.2f}")
+                          if scn == "realistic" and mult == 1.0:
+                              oos_trades = r["trades"]
+                              mc_src = [t["r_multiple"] for t in r["trades"]]
+                  ks = [1.0, 1.5, 2.0, 2.5, 3.0, 4.0, 5.0]
+                  nets = [stress["realistic" if k == 1.0 else f"realisticx{k}"]["Net_Profit"]
+                          for k in ks]
+                  bk = "N/A (baseline negative)" if stress["realistic"]["Net_Profit"] <= 0 else ">5.0"
+                  for i in range(len(ks) - 1):
+                      if nets[i] > 0 >= nets[i + 1]:
+                          f = nets[i] / (nets[i] - nets[i + 1])
+                          bk = round(ks[i] + f * (ks[i + 1] - ks[i]), 2); break
+                  mc = simulate(mc_src, a.risk)
+                  tag_trades(oos_trades, regtab)
+                  psym = per_symbol(oos_trades)
+                  save_trades(oos_trades, "outputs/oos/trade_log_oos.csv")
+                  save_metrics(stress, "outputs/oos/cost_stress.json")
+                  save_metrics(mc, "outputs/oos/monte_carlo.json")
+                  save_metrics({k: mrow(v) for k, v in psym.items()},
+                               "outputs/oos/metrics_by_symbol.json")
+                  save_metrics({k: mrow(v) for k, v in per_regime(oos_trades).items()},
+                               "outputs/oos/metrics_by_regime.json")
+                  wf_sum = Path("outputs/walkforward/summary.json")
+                  sens_rep = Path("outputs/sensitivity/report.json")
+                  gates = evaluate_gates(
+                      stress["realistic"],
+                      json.loads(wf_sum.read_text()) if wf_sum.exists() else dict(
+                          n_windows=1, profitable=0, aggregate={"Profit_Factor": 0}, worst_window=-100),
+                      json.loads(sens_rep.read_text()) if sens_rep.exists() else dict(
+                          profitable_neighbor_share=0),
+                      mc, psym, dict(conservative_net=stress["conservative"]["Net_Profit"]))
+                  gates["breakeven_cost_multiple"] = bk
+                  save_metrics(gates, "outputs/oos/gates.json")
+                  append_experiment_log(dict(
+                      Version=params["version"], Date=pd.Timestamp.utcnow().isoformat(),
+                      Changes=json.loads(fin.read_text()) if fin.exists() else "baseline as finalist",
+                      Reason="finalist OOS evaluation (single pass)",
+                      Train_Result="outputs/baseline", Validation_Result="outputs/sensitivity",
+                      WF_Result="outputs/walkforward", OOS_Result="outputs/oos",
+                      Decision=gates["verdict"]))
+                  print("\n================ FINAL VERDICT ================")
+                  print(gates["verdict"])
+                  print(f"Breakeven cost multiple: {bk}")
+                  print("Gates:", json.dumps(gates["gates"], indent=2))
+
+          if __name__ == "__main__":
+              main()
+          EOF
+          cat > tests/test_causality.py <<'EOF'
+          """Anti-lookahead test: poisoning FUTURE data must not change PAST trades."""
+          import sys, pathlib
+          sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
+          import pandas as pd
+          import data as datamod
+          from config import BASE_PARAMS, COST_SCENARIOS
+          from backtest import run_backtest
+
+          def main():
+              d15, d4 = datamod.load(symbols=["BTCUSDT"])
+              cut = "2021-06-30"
+              r1 = run_backtest(d15, d4, dict(BASE_PARAMS), COST_SCENARIOS["realistic"], end=cut)
+              d15b = {s: df.copy() for s, df in d15.items()}
+              d4b = {s: df.copy() for s, df in d4.items()}
+              for df in list(d15b.values()) + list(d4b.values()):
+                  m = df.index > pd.Timestamp(cut)
+                  df.loc[m, ["open", "high", "low", "close"]] = 999_999.0
+              r2 = run_backtest(d15b, d4b, dict(BASE_PARAMS), COST_SCENARIOS["realistic"], end=cut)
+              t1 = [(t["setup_id"], t["entry_ns"], t["exit_ns"], round(t["pnl"], 10))
+                    for t in r1["trades"]]
+              t2 = [(t["setup_id"], t["entry_ns"], t["exit_ns"], round(t["pnl"], 10))
+                    for t in r2["trades"]]
+              assert t1 == t2, "LOOKAHEAD DETECTED: past trades changed by future data"
+              print(f"CAUSALITY OK - {len(t1)} trades identical with poisoned future data")
+
+          if __name__ == "__main__":
+              main()
+          EOF
+          echo "source files written:"; ls -la
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Download real data (official Binance dump) + quality audit
+        run: python run_all.py --stage data
+
+      - name: Causality test (anti-lookahead, mandatory)
+        run: python tests/test_causality.py
+
+      - name: Baseline backtest (Train+Val, 3 cost scenarios)
+        run: python run_all.py --stage baseline
+
+      - name: Walk-Forward
+        run: python run_all.py --stage wf
+
+      - name: Sensitivity
+        run: python run_all.py --stage sens
+
+      - name: OOS + Cost Stress + Monte Carlo + Gates
+        run: python run_all.py --stage oos
+
+      - name: Show final verdict
+        run: |
+          echo "================ FINAL VERDICT ================"
+          cat outputs/oos/gates.json || echo "gates.json missing - check earlier steps"
+          echo "================ EXPERIMENT LOG ================"
+          cat outputs/logs/experiment_log.csv || true
+
+      - name: Upload real reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mg-reports
+          path: outputs/
