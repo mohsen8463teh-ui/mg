@@ -1363,7 +1363,7 @@ jobs:
               main()
           EOF
           echo "source files written:"; ls -la
-      - name: Patch backtest.py (v1.0.4-IMPL: entry fill ordering fix)
+      - name: Patch backtest.py (v1.0.4-IMPL- entry fill ordering fix)
         run: |
           cat > backtest.py <<'EOF'
           """Event-driven backtester. Only clock = close of 15m candles.
