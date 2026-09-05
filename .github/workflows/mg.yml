@@ -1447,8 +1447,7 @@ jobs:
               audits = {s: e.audit for s, e in engs.items()}
               return dict(trades=pf.trades, curve_t=curve_t, curve_v=curve_v,
                           audits=audits, fees=pf.fees_total, slippage=pf.slip_total)
-          EOF 
-
+          EOF
       - name: Install dependencies
         run: pip install -r requirements.txt
 
